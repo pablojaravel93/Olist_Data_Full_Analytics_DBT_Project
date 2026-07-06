@@ -1,0 +1,71 @@
+
+#Set project name to interpolate in these
+$PROJECT = gcloud config get-value project
+
+# ── 1. Data lake bucket ─────────────────────────────────────────────
+gcloud storage buckets create gs://${PROJECT}-datalake `
+  --location=US `
+  --uniform-bucket-level-access `
+  --public-access-prevention
+
+gcloud storage buckets describe gs://${PROJECT}-datalake --format="yaml(location,iamConfiguration)"
+
+# Lifecycle guardrail: auto-delete raw partitions after 60 days
+# (lifecycle.json must exist — content in TUTORIAL.md §1.7 / previous message)
+@'
+{
+  "rule": [
+    {
+      "action":    { "type": "Delete" },
+      "condition": { "age": 60, "matchesPrefix": ["raw/"] }
+    }
+  ]
+}
+'@ | Set-Content -Path lifecycle.json -Encoding utf8
+
+gcloud storage buckets update gs://${PROJECT}-datalake --lifecycle-file=lifecycle.json
+
+gcloud storage buckets describe gs://${PROJECT}-datalake --format="yaml(lifecycle_config)"
+
+# ── 2. Service account ──────────────────────────────────────────────
+gcloud iam service-accounts create sa-ingestion `
+  --display-name="Olist ingestion" `
+  --description="Cloud Run function: Kaggle -> GCS -> BigQuery raw"
+
+# ── 3. Permissions (least privilege, resource-scoped) ───────────────
+# 3a. GCS: write/overwrite objects in the data lake bucket only
+gcloud storage buckets add-iam-policy-binding gs://${PROJECT}-datalake `
+  --member="serviceAccount:sa-ingestion@${PROJECT}.iam.gserviceaccount.com" `
+  --role="roles/storage.objectAdmin"
+
+# 3b. Secret Manager: read the Kaggle secret only
+#     (requires the secret to exist: gcloud secrets create kaggle-credentials ...)
+
+# I created the secret it in GCLOUD console
+KAGGLE_API_TOKEN = "KGAT_aea82c4ebe39ef32529b55c479b3b6e2"
+
+gcloud secrets add-iam-policy-binding kaggle-credentials `
+  --member="serviceAccount:sa-ingestion@${PROJECT}.iam.gserviceaccount.com" `
+  --role="roles/secretmanager.secretAccessor"
+
+# 3c. BigQuery: run load jobs (project-level by necessity; grants no data access)
+gcloud projects add-iam-policy-binding $PROJECT `
+  --member="serviceAccount:sa-ingestion@${PROJECT}.iam.gserviceaccount.com" `
+  --role="roles/bigquery.jobUser"
+
+#Create BQ dataset 
+
+
+# 3d. BigQuery: edit data in raw_olist ONLY (dataset-level, via bq)
+#     (requires the dataset to exist: bq mk --location=US --dataset ${PROJECT}:raw_olist)
+bq show --format=prettyjson ${PROJECT}:raw_olist > raw_olist_access.json
+# manually add to the "access" array in raw_olist_access.json:
+#   { "role": "roles/bigquery.dataEditor",
+#     "userByEmail": "sa-ingestion@<paste-real-project-id>.iam.gserviceaccount.com" }
+bq update --source raw_olist_access.json ${PROJECT}:raw_olist
+
+# ── 4. Verify ────────────────────────────────────────────────────────
+gcloud projects get-iam-policy $PROJECT --flatten="bindings[].members" `
+  --filter="bindings.members:sa-ingestion" --format="table(bindings.role)"
+# expected: ONLY roles/bigquery.jobUser at project level
+

@@ -1,0 +1,7 @@
+﻿.venv/
+__pycache__/
+target/
+dbt_packages/
+logs/
+token.txt
+raw_olist_access.json
