@@ -94,7 +94,7 @@ flowchart LR
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Language | Python 3.12 | One venv for the whole repo |
+| Language | Python 3.13 locally (3.12 on Cloud Run runtimes) | Project venv: `.venv/` in the repo root |
 | Ingestion | Cloud Run **function** (2nd gen), `functions-framework`, `kaggle`, `google-cloud-storage` | HTTP-triggered, called by Cloud Scheduler |
 | Data lake | Google Cloud Storage | Single bucket, zoned prefixes |
 | Warehouse | Google BigQuery | On-demand pricing, `US` (or your preferred) location — pick ONE location and never mix |
