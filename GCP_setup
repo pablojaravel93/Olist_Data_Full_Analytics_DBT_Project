@@ -69,3 +69,5 @@ gcloud projects get-iam-policy $PROJECT --flatten="bindings[].members" `
   --filter="bindings.members:sa-ingestion" --format="table(bindings.role)"
 # expected: ONLY roles/bigquery.jobUser at project level
 
+
+
