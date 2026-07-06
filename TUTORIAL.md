@@ -73,7 +73,7 @@ Minimal role map (grant with `gcloud projects add-iam-policy-binding` or per-res
 ### 1.5 Python venv + dbt (Windows)
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.13 -m venv .venv     # 3.12+ all work; 3.13 is what's installed on this machine
 .\.venv\Scripts\Activate.ps1
 pip install dbt-bigquery google-cloud-storage google-cloud-bigquery functions-framework kaggle dash gunicorn
 dbt --version
@@ -240,6 +240,7 @@ olist:
       dataset: dbt_pjaramillo
       location: US
       threads: 4
+      maximum_bytes_billed: 10737418240   # 10 GB cap per query — cost guardrail
     prod:
       type: bigquery
       method: oauth                 # in Cloud Run, ADC = the job's service account
@@ -248,6 +249,7 @@ olist:
       location: US
       threads: 8
       priority: interactive
+      maximum_bytes_billed: 10737418240   # 10 GB cap per query — cost guardrail
 ```
 
 Point dbt at a committed profiles dir with `--profiles-dir ./profiles` or `DBT_PROFILES_DIR`. No secrets needed when using oauth/ADC everywhere.
