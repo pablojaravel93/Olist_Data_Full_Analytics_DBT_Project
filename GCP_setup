@@ -42,7 +42,7 @@ gcloud storage buckets add-iam-policy-binding gs://${PROJECT}-datalake `
 #     (requires the secret to exist: gcloud secrets create kaggle-credentials ...)
 
 # I created the secret it in GCLOUD console
-KAGGLE_API_TOKEN = "KGAT_aea82c4ebe39ef32529b55c479b3b6e2"
+KAGGLE_API_TOKEN = <Secret token>
 
 gcloud secrets add-iam-policy-binding kaggle-credentials `
   --member="serviceAccount:sa-ingestion@${PROJECT}.iam.gserviceaccount.com" `
@@ -57,12 +57,17 @@ gcloud projects add-iam-policy-binding $PROJECT `
 
 
 # 3d. BigQuery: edit data in raw_olist ONLY (dataset-level, via bq)
-#     (requires the dataset to exist: bq mk --location=US --dataset ${PROJECT}:raw_olist)
-bq show --format=prettyjson ${PROJECT}:raw_olist > raw_olist_access.json
-# manually add to the "access" array in raw_olist_access.json:
-#   { "role": "roles/bigquery.dataEditor",
-#     "userByEmail": "sa-ingestion@<paste-real-project-id>.iam.gserviceaccount.com" }
-bq update --source raw_olist_access.json ${PROJECT}:raw_olist
+#     Requires the dataset to exist: bq mk --location=US --dataset ${PROJECT}:raw_olist
+#     WRITER == roles/bigquery.dataEditor; service accounts go under userByEmail.
+#     WriteAllText (not Set-Content) = BOM-free JSON, or bq fails "Expecting value: line 1 column 1".
+#     Guarded so re-running doesn't add duplicate access entries.
+$o = bq show --format=prettyjson "${PROJECT}:raw_olist" | ConvertFrom-Json
+$sa = "sa-ingestion@$PROJECT.iam.gserviceaccount.com"
+if (-not ($o.access | Where-Object { $_.userByEmail -eq $sa })) {
+    $o.access += [pscustomobject]@{ role = "WRITER"; userByEmail = $sa }
+    [System.IO.File]::WriteAllText("$PWD\_acc.json", ($o | ConvertTo-Json -Depth 30))
+    bq update --source _acc.json "${PROJECT}:raw_olist"; Remove-Item _acc.json
+}
 
 # ── 4. Verify ────────────────────────────────────────────────────────
 gcloud projects get-iam-policy $PROJECT --flatten="bindings[].members" `
