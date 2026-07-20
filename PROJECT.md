@@ -14,7 +14,7 @@
 4. [Repository Layout](#4-repository-layout)
 5. [The Dataset](#5-the-dataset)
 6. [Phase 0 — Foundations (GCP + GitHub setup)](#phase-0--foundations)
-7. [Phase 1 — Ingestion: Cloud Run Function → GCS Data Lake](#phase-1--ingestion)
+7. [Phase 1 — Ingestion: Cloud Run Job → GCS Data Lake](#phase-1--ingestion)
 8. [Phase 2 — Data Lake → BigQuery Raw Layer](#phase-2--data-lake--bigquery-raw-layer)
 9. [Phase 3 — The dbt Project (Core of the Certification Prep)](#phase-3--the-dbt-project)
 10. [Phase 4 — Production dbt: Cloud Run Job](#phase-4--production-dbt-cloud-run-job)
@@ -31,7 +31,7 @@
 
 **Objective:** A live, end-to-end analytics platform where:
 
-1. A **Cloud Run function** ingests the Olist dataset into **Google Cloud Storage** (the data lake) on a schedule.
+1. A **Cloud Run job** ingests the Olist dataset into **Google Cloud Storage** (the data lake) on a schedule.
 2. Raw data is loaded into **BigQuery** (the data warehouse).
 3. A **dbt** project transforms raw data into tested, documented, governed marts — developed locally, executed in production by a **Cloud Run job**.
 4. A **Dash** dashboard, deployed as a **Cloud Run service**, visualizes the marts.
@@ -51,7 +51,7 @@
 ```mermaid
 flowchart LR
     subgraph Ingestion
-        KG[Kaggle API<br/>Olist dataset] --> CRF[Cloud Run Function<br/>ingest-olist]
+        KG[Kaggle API<br/>Olist dataset] --> CRF[Cloud Run Job<br/>ingest-olist]
     end
     subgraph Data Lake
         CRF --> GCS[(GCS Bucket<br/>raw zone)]
@@ -95,7 +95,7 @@ flowchart LR
 | Layer | Technology | Notes |
 |---|---|---|
 | Language | Python 3.13 locally (3.12 on Cloud Run runtimes) | Project venv: `.venv/` in the repo root |
-| Ingestion | Cloud Run **function** (2nd gen), `functions-framework`, `kaggle`, `google-cloud-storage` | HTTP-triggered, called by Cloud Scheduler |
+| Ingestion | Cloud Run **job** (Docker image), `kaggle`, `google-cloud-storage`, `google-cloud-bigquery` | Executed weekly by Cloud Scheduler via the `jobs:run` API |
 | Data lake | Google Cloud Storage | Single bucket, zoned prefixes |
 | Warehouse | Google BigQuery | On-demand pricing, `US` (or your preferred) location — pick ONE location and never mix |
 | Transformation | **dbt Core ≥ 1.10** + `dbt-bigquery` adapter | The heart of the project |
@@ -118,12 +118,11 @@ Target structure of this repo when finished:
 ├── TUTORIAL.md
 ├── README.md
 ├── .gitignore
-├── ingestion/                  # Phase 1
-│   ├── main.py
+├── ingestion/                  # Phases 1+2: Kaggle -> GCS -> BigQuery raw
+│   ├── main.py                 # run_ingestion() + __main__ job entrypoint
 │   ├── requirements.txt
-│   └── tests/
-├── warehouse/                  # Phase 2
-│   └── load_raw.py             # GCS -> BigQuery load logic (or part of ingestion)
+│   ├── Dockerfile
+│   └── deploy.ps1              # build image, push to Artifact Registry, deploy job + schedule
 ├── dbt/                        # Phase 3 — the dbt project
 │   ├── dbt_project.yml
 │   ├── packages.yml
@@ -205,8 +204,8 @@ Target structure of this repo when finished:
 
 ## Phase 1 — Ingestion
 
-**Goal:** A Cloud Run function that downloads the Olist dataset from Kaggle and lands it in the GCS data lake, idempotently, on a schedule.
-**Tutorial:** [TUTORIAL.md §2 — Ingestion](TUTORIAL.md#2-ingestion-cloud-run-function--gcs)
+**Goal:** A Cloud Run job that downloads the Olist dataset from Kaggle and lands it in the GCS data lake, idempotently, on a schedule.
+**Tutorial:** [TUTORIAL.md §2 — Ingestion](TUTORIAL.md#2-ingestion-cloud-run-job--gcs)
 
 ### Requirements
 
@@ -216,20 +215,21 @@ Target structure of this repo when finished:
      raw/olist/<table_name>/ingestion_date=YYYY-MM-DD/<table_name>.csv
      dbt-state/prod/          # Phase 4 artifacts land here
    ```
-2. **Cloud Run function `ingest-olist`** (Python 3.12, HTTP trigger):
+2. **Cloud Run job `ingest-olist`** (Python 3.13 Docker image; built, pushed, and deployed by `ingestion/deploy.ps1`):
    - Fetches the Kaggle API token from **Secret Manager** and exposes it as `KAGGLE_API_TOKEN` (never bake the token into the image or repo; the old `kaggle.json` flow is legacy).
    - Downloads and unzips `olistbr/brazilian-ecommerce`.
    - Uploads each of the 9 CSVs to the dated raw path.
    - **Idempotent:** re-running on the same day overwrites the same partition; no duplicate-day data.
-   - Returns a JSON summary `{table: rows_uploaded}` and logs structured messages.
-3. **Cloud Scheduler** job triggers the function weekly (the dataset is static — the schedule exists to practice orchestration; note this in the README).
-4. **Local dev path:** the same `main.py` runnable locally with `functions-framework --target=ingest`.
+   - Logs a per-table summary `{table: row_count}` and exits non-zero on failure (a failed execution is visible in Cloud Run and retried per `--max-retries`).
+3. **Cloud Scheduler** executes the job weekly via the `jobs:run` REST endpoint, authenticating as `sa-ingestion` with OAuth (the dataset is static — the schedule exists to practice orchestration; note this in the README).
+4. **Local dev path:** the same `main.py` runs locally with plain `python ingestion/main.py` (two env vars + your ADC) — the identical code path the container runs.
+5. **Deliberately NOT incremental:** raw stays full-rewrite every run — simplest idempotency for a small static dataset. "Data arriving over time" is simulated downstream in dbt via the visibility cursor (3.2), which is where the incremental learning happens.
 
 ### Acceptance criteria
 
-- [ ] `curl` (authenticated) to the function URL completes and all 9 CSVs appear under today's `ingestion_date=` prefix.
-- [ ] Second invocation the same day does not duplicate data.
-- [ ] Scheduler trigger succeeds (check Cloud Run logs).
+- [ ] `gcloud run jobs execute ingest-olist --region=us-central1 --wait` succeeds and all 9 CSVs appear under today's `ingestion_date=` prefix.
+- [ ] Second execution the same day does not duplicate data.
+- [ ] Scheduler trigger works (`gcloud scheduler jobs run ingest-olist-weekly --location=us-central1`, then check the execution in Cloud Run logs).
 - [ ] No secrets in the repo or the container image.
 
 ---
@@ -242,7 +242,7 @@ Target structure of this repo when finished:
 ### Requirements
 
 1. Create dataset `raw_olist` (same location as everything else) with labels (`env=raw`, `owner=pjaramillo`).
-2. Extend the ingestion function (or add a small `load_raw.py` step) to run **BigQuery load jobs** from the latest GCS partition into `raw_olist.<table_name>`, using `WRITE_TRUNCATE`, autodetected-then-pinned schemas, and an added `_loaded_at TIMESTAMP` column (you'll use this for **source freshness** in Phase 3).
+2. Extend the ingestion job (implemented in `ingestion/main.py::_load_to_bigquery`) to run **BigQuery load jobs** from the latest GCS partition into `raw_olist.<table_name>`, using `WRITE_TRUNCATE`, autodetected-then-pinned schemas, and an added `_loaded_at TIMESTAMP` column (you'll use this for **source freshness** in Phase 3).
 3. Every raw table keeps original column names — transformation belongs to dbt, not the loader (ELT, not ETL).
 4. *(Stretch)* Also expose one table as an **external/BigLake table** over GCS and compare trade-offs in the README.
 5. Create the empty datasets for later phases: `analytics`, `dbt_pjaramillo` (dbt will create schemas within, but having explicit datasets makes IAM cleaner).
@@ -280,6 +280,7 @@ This phase is split into 10 workstreams (3.1–3.10). Do them roughly in order; 
   - source- and table-level descriptions
   - source tests (e.g. `unique` on raw primary keys — some will FAIL by design, e.g. reviews; capture what you learn)
 - One **staging model per source table** (`stg_olist__orders.sql`, etc.): rename to snake_case English, cast types, convert timestamps, no joins, no aggregation. Use `codegen` package to generate boilerplate.
+- **Visibility cursor (simulated daily arrivals):** since Olist is frozen history, `stg_olist__orders` filters to `order_purchase_timestamp <= var('as_of_date', '2018-12-31')`. The default sees full history (prod/CI unaffected); overriding the var in dev simulates data "arriving" run by run, which makes the incremental models in 3.3 genuinely merge new rows. The cursor lives in this ONE model — child entities (items, payments, reviews) inherit it downstream through their joins to orders (DRY). See TUTORIAL §4.12 for the drill.
 - Use `{{ source() }}` everywhere — zero hardcoded table names from here on. **[Cert: identifying raw object dependencies]**
 
 ### 3.3 Intermediate & marts modeling **[Cert: Topic 1 — modularity, DAG design, materializations, SQL]**
@@ -293,6 +294,7 @@ Build a layered DAG (staging → intermediate → marts), aiming for a clean `db
   - `fct_orders` — **incremental** materialization: `unique_key='order_id'`, `incremental_strategy='merge'`, `is_incremental()` filter on `order_purchase_timestamp`, `on_schema_change='append_new_columns'`. Partition by order date, cluster by `customer_state` (BigQuery-specific configs).
   - `fct_order_items` — **incremental (microbatch strategy)**: item grain with margins/freight. Configure `incremental_strategy='microbatch'`, `event_time='order_purchase_date'`, `batch_size='month'`, `lookback=1`, `begin='2016-09-01'` — and set `event_time` on the upstream staging model too, or batch filtering won't reach it. Observe the per-batch runs in the logs, then retry a single failed batch and backfill a date range with `--event-time-start/--event-time-end`.
   - Write a short **incremental strategy selection** note in the README or model YAML: when to choose `append` vs `merge` vs `insert_overwrite` vs `microbatch` for a given dataset's characteristics (see TUTORIAL §4.3 table) — the exam tests *choosing*, not just configuring.
+  - **Incremental replay drill (required):** using the 3.2 visibility cursor, build with `--vars '{as_of_date: 2017-01-31}'`, then advance the date across 3–4 runs and watch `fct_orders` merge only the newly visible rows and the microbatch model process only new batches. Finish with a default (full-history) build and one `--full-refresh` reset. Log observed row counts per run — this is your proof that you've *seen* `is_incremental()` work, not just configured it.
   - `dim_customers` — table; one row per `customer_unique_id` with lifetime metrics
   - `dim_products` — table; joined with the category-translation **seed or staging** model
   - `dim_sellers`, `dim_date` (generate with `dbt_utils.date_spine`)
@@ -392,6 +394,7 @@ Deliberately practice each failure class and write a short "lab note" for each i
 3. Push image to **Artifact Registry**; create Cloud Run **job** `dbt-build` running as `sa-dbt-runner` (auth via ADC — no keyfile in the image).
 4. **Cloud Scheduler** executes the job nightly, ≥ 1h after the ingestion schedule.
 5. Prod builds land in `analytics_staging` / `analytics_marts` / `analytics_snapshots` via your `generate_schema_name` override — verify dev and prod are fully isolated.
+6. *(Stretch)* **Auto-advancing prod cursor:** make the nightly job's merges real by computing `as_of_date` instead of defaulting to full history — a macro mapping days-since-go-live to simulated dates (e.g. 1 real day = 1 simulated month), or the entrypoint passing `--vars` derived from the run date. Optional: full-history default is also a perfectly valid prod stance.
 
 ### Acceptance criteria
 

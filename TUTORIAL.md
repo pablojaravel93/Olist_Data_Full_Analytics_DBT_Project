@@ -5,7 +5,7 @@
 **Contents**
 
 1. [Environment & GCP Setup](#1-environment--gcp-setup)
-2. [Ingestion (Cloud Run Function → GCS)](#2-ingestion-cloud-run-function--gcs)
+2. [Ingestion (Cloud Run Job → GCS)](#2-ingestion-cloud-run-job--gcs)
 3. [BigQuery Raw Layer](#3-bigquery-raw-layer)
 4. [dbt — Concepts, Cheat Sheets, and How-Tos](#4-dbt--concepts-cheat-sheets-and-how-tos)
 5. [Docker & Cloud Run](#5-docker--cloud-run)
@@ -75,7 +75,7 @@ Minimal role map (grant with `gcloud projects add-iam-policy-binding` or per-res
 ```powershell
 py -3.13 -m venv .venv     # 3.12+ all work; 3.13 is what's installed on this machine
 .\.venv\Scripts\Activate.ps1
-pip install dbt-bigquery google-cloud-storage google-cloud-bigquery functions-framework kaggle dash gunicorn
+pip install dbt-bigquery google-cloud-storage google-cloud-bigquery google-cloud-secret-manager kaggle dash gunicorn
 dbt --version
 ```
 
@@ -110,70 +110,59 @@ gsutil lifecycle set lifecycle.json gs://<project>-datalake
 
 ---
 
-## 2. Ingestion (Cloud Run Function → GCS)
+## 2. Ingestion (Cloud Run Job → GCS)
 
-### 2.1 Skeleton `main.py`
+The implementation lives in `ingestion/` — `main.py` (the pipeline), `Dockerfile`, `requirements.txt`, and `deploy.ps1` (build + push + deploy + schedule, idempotent).
 
-```python
-import functions_framework
-from google.cloud import storage, secretmanager
-import os, tempfile, datetime
+### 2.1 Structure of `main.py`
 
-def _load_kaggle_token():
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{os.environ['GCP_PROJECT']}/secrets/kaggle-credentials/versions/latest"
-    token = client.access_secret_version(name=name).payload.data.decode().strip()
-    os.environ["KAGGLE_API_TOKEN"] = token
+Four functions, one per concern, sequenced by `run_ingestion()` and executed once-to-completion by the `if __name__ == "__main__":` job entrypoint:
 
-@functions_framework.http
-def ingest(request):
-    _load_kaggle_token()
-    import kaggle  # import AFTER the token env var is set — kaggle authenticates at import time
-    today = datetime.date.today().isoformat()
-    with tempfile.TemporaryDirectory() as tmp:
-        kaggle.api.dataset_download_files("olistbr/brazilian-ecommerce", path=tmp, unzip=True)
-        bucket = storage.Client().bucket(os.environ["BUCKET"])
-        summary = {}
-        for f in os.listdir(tmp):
-            if not f.endswith(".csv"):
-                continue
-            table = f.replace(".csv", "")
-            blob = bucket.blob(f"raw/olist/{table}/ingestion_date={today}/{f}")
-            blob.upload_from_filename(os.path.join(tmp, f))
-            summary[table] = "uploaded"
-    return summary, 200
-```
+| Function | Does | Gotcha it encodes |
+|---|---|---|
+| `_load_kaggle_token()` | Secret Manager → `KAGGLE_API_TOKEN` env var | Must run **before** `import kaggle` |
+| `_download_from_kaggle()` | Downloads + unzips the 9 CSVs to a temp dir | `import kaggle` is *inside* the function — the package authenticates at import time |
+| `_upload_to_gcs()` | Uploads each CSV to `raw/olist/<table>/ingestion_date=YYYY-MM-DD/` | Idempotency is free: same day → same object name → overwrite |
+| `_load_to_bigquery()` | GCS → temp table → `CREATE OR REPLACE` real table with `_loaded_at` | `allow_quoted_newlines=True` — Olist review comments contain newlines inside quoted fields |
 
-Idempotency comes free: same-day re-runs overwrite the same blob path.
+A Python exception anywhere exits non-zero, which Cloud Run records as a **failed execution** (and retries per `--max-retries`). No HTTP server anywhere — jobs run to completion, they don't listen.
 
 ### 2.2 Run locally
 
+Same code path as the container — plain Python with your ADC:
+
 ```powershell
-$env:GCP_PROJECT="olist-analytics-<suffix>"; $env:BUCKET="<project>-datalake"
-functions-framework --target=ingest --debug
-# in another terminal:
-curl http://localhost:8080
+$env:GCP_PROJECT = "olist-analytics-<suffix>"
+$env:BUCKET      = "<project>-datalake"
+python ingestion\main.py
+```
+
+Expect a few minutes (Kaggle download + 9 uploads + 9 load jobs). Verify afterwards:
+
+```powershell
+gcloud storage ls "gs://<project>-datalake/raw/olist/**"
+bq query --use_legacy_sql=false "SELECT table_id, row_count FROM raw_olist.__TABLES__ ORDER BY table_id"
 ```
 
 ### 2.3 Deploy + schedule
 
-```powershell
-gcloud functions deploy ingest-olist --gen2 --runtime=python312 --region=us-central1 `
-  --source=ingestion --entry-point=ingest --trigger-http --no-allow-unauthenticated `
-  --service-account=sa-ingestion@<project>.iam.gserviceaccount.com `
-  --set-env-vars GCP_PROJECT=<project>,BUCKET=<project>-datalake `
-  --memory=1Gi --timeout=540
-
-gcloud scheduler jobs create http ingest-olist-weekly --schedule="0 6 * * 1" `
-  --uri=<FUNCTION_URL> --http-method=POST --location=us-central1 `
-  --oidc-service-account-email=sa-ingestion@<project>.iam.gserviceaccount.com
-```
-
-Test an authenticated call yourself:
+Everything is scripted — from the `ingestion/` folder, with Docker Desktop running:
 
 ```powershell
-curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" <FUNCTION_URL>
+.\deploy.ps1
 ```
+
+What it does (in order): creates the Artifact Registry repo `analytics` if missing → configures Docker auth → `docker build` + `push` → `gcloud run jobs deploy ingest-olist` (create-or-update, runs as `sa-ingestion`, 1 GiB, 15-min timeout) → grants `sa-ingestion` `roles/run.invoker` on the job → creates/updates the weekly Cloud Scheduler trigger hitting the `jobs:run` REST endpoint.
+
+Manual runs and checks:
+
+```powershell
+gcloud run jobs execute ingest-olist --region=us-central1 --wait      # run now
+gcloud scheduler jobs run ingest-olist-weekly --location=us-central1  # test the trigger path
+gcloud run jobs executions list --job=ingest-olist --region=us-central1
+```
+
+> **Auth note:** Scheduler → `run.googleapis.com` uses `--oauth-service-account-email` (OAuth token), NOT `--oidc-...`. OIDC is for your own HTTP endpoints; Google's APIs take OAuth. Mixing these up is the #1 scheduler-403 cause (§8.1).
 
 ---
 
@@ -539,6 +528,40 @@ exposures:
 
 `dbt ls --select +exposure:olist_dashboard` = "what feeds my dashboard"; run it before changing anything upstream.
 
+### 4.12 Simulated daily loads — the `as_of_date` cursor
+
+Olist is frozen history (2016–2018), so out of the box every incremental run after the first finds zero new rows. The cursor makes incrementality real without touching ingestion: one filter in `stg_olist__orders` controls how much history the whole DAG can "see".
+
+```sql
+-- at the bottom of stg_olist__orders.sql
+where order_purchase_timestamp <= timestamp('{{ var("as_of_date", "2018-12-31") }}')
+```
+
+- **Default = full history** → prod, CI, and anyone who doesn't pass the var get everything. The simulation is strictly opt-in.
+- **One filter only.** Don't repeat it in items/payments/reviews staging models — they inherit visibility downstream by joining to orders in the intermediate/mart layers. Repeating the filter would violate DRY and eventually disagree with itself.
+
+**The replay drill** (PROJECT 3.3): run these in sequence and note the merge counts dbt logs for `fct_orders`:
+
+```powershell
+dbt build --vars '{as_of_date: 2017-01-31}'   # first build: everything visible so far
+dbt build --vars '{as_of_date: 2017-02-28}'   # merges ~1 month of "new" orders
+dbt build --vars '{as_of_date: 2017-06-30}'   # merges ~4 months
+dbt build                                      # default: rest of history arrives
+dbt build --full-refresh                       # reset: rebuild incrementals from scratch
+```
+
+(PowerShell note: keep the single quotes around the YAML dict exactly as shown — single-quoted strings pass through literally.)
+
+What to watch each run: the `fct_orders` log line switches from `create table` (first run) to `merge` with a row count matching the newly visible window; the microbatch model logs one batch per new event-time period instead of reprocessing everything; `dim_customers` (a `table` model) rebuilds fully every time regardless — a nice side-by-side of materialization behaviors.
+
+**The gotcha that will bite you once:** staging models are *views*, and the var is rendered into the view's SQL **at build time**. If you advance the var but `--select fct_orders` only, the staging view still contains the *old* date and nothing new appears. Always rebuild the cursor's carrier along with the consumers — plain `dbt build` (everything) or `--select stg_olist__orders+`. When this bites, the debugging move is the usual one: read the compiled/deployed view SQL and you'll see the stale literal date sitting in it.
+
+**Backfill practice:** with the microbatch model, replay a specific window without touching the rest:
+
+```powershell
+dbt run --select fct_order_items --event-time-start "2017-03-01" --event-time-end "2017-05-01"
+```
+
 ---
 
 ## 5. Docker & Cloud Run
@@ -765,7 +788,7 @@ Workflow: read the message → open the model's file in `target/compiled/` (or `
 | Job dies mid-`dbt build`, exit 137 | Out of memory → raise `--memory`, lower `threads` |
 | `permission denied` pulling/pushing image | `gcloud auth configure-docker <region>-docker.pkg.dev` not run, or missing `artifactregistry.writer` |
 | Job succeeds locally, fails in Cloud Run with auth errors | Locally you're *you*; in Cloud Run it's the job's SA — grant the SA the missing role |
-| Kaggle import crashes at cold start | `import kaggle` before `KAGGLE_API_TOKEN` is set — import inside the handler after loading the secret |
+| Kaggle import crashes at job start | `import kaggle` at module level, before `KAGGLE_API_TOKEN` is set — keep the import inside the download function, after the secret is loaded |
 | Kaggle auth fails with a valid token | Trailing newline stored in the secret (recreate with `-NoNewline`), or an old `kaggle` package version that predates `KAGGLE_API_TOKEN` — upgrade it |
 
 ### 8.6 GitHub Actions

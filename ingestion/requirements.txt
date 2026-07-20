@@ -1,0 +1,5 @@
+functions-framework
+kaggle
+google-cloud-storage
+google-cloud-bigquery
+google-cloud-secret-manager

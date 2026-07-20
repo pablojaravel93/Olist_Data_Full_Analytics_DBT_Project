@@ -5,3 +5,4 @@ dbt_packages/
 logs/
 token.txt
 raw_olist_access.json
+lifecycle.json
