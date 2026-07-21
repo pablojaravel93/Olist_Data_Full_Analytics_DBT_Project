@@ -1,0 +1,21 @@
+version: 2
+
+sources:
+  - name: olist
+    database: olist-analytics-501518   # your GCP project
+    schema: raw_olist                  # the BigQuery dataset
+    description: "Raw Olist e-commerce tables, loaded by the ingestion job."
+    freshness:
+      warn_after:  {count: 8, period: day}
+      error_after: {count: 15, period: day}
+    loaded_at_field: _loaded_at         # the column your ingestion job added
+    tables:
+      - name: olist_customers_dataset
+      - name: olist_geolocation_dataset
+      - name: olist_order_items_dataset
+      - name: olist_order_payments_dataset
+      - name: olist_order_reviews_dataset
+      - name: olist_orders_dataset
+      - name: olist_products_dataset
+      - name: olist_sellers_dataset
+      - name: product_category_name_translation
