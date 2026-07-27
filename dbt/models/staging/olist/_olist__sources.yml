@@ -15,6 +15,13 @@ sources:
       - name: olist_order_items_dataset
       - name: olist_order_payments_dataset
       - name: olist_order_reviews_dataset
+        columns:
+          - name: review_id
+            data_tests:
+              - unique:
+                  config:
+                    severity: warn
+              - not_null
       - name: olist_orders_dataset
       - name: olist_products_dataset
       - name: olist_sellers_dataset
