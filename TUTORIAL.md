@@ -172,8 +172,8 @@ gcloud run jobs executions list --job=ingest-olist --region=us-central1
 
 ```powershell
 bq mk --location=US --dataset --label env:raw --label owner:pjaramillo <project>:raw_olist
-bq mk --location=US --dataset <project>:analytics
-bq mk --location=US --dataset <project>:dbt_pjaramillo
+bq mk --location=US --dataset ${PROJECT}:analytics
+bq mk --location=US --dataset ${PROJECT}:dbt_pjaramillo
 ```
 
 > **Location is forever.** Every dataset (and the GCS bucket, ideally) must share one location. Cross-location queries/loads fail with `Not found: Dataset` or explicit location errors.
@@ -883,3 +883,13 @@ Official outline lives in [dbt_Study_Guide_AI_Knowledge_Base.md](dbt_Study_Guide
 2. Work the 10 sample questions in [dbt_Study_Guide_AI_Knowledge_Base.md](dbt_Study_Guide_AI_Knowledge_Base.md) cold and justify each answer — their themes (test `where` config, incremental suitability, git pull, `ref()` dependencies, source counting, `1+model` selection, `--empty` gotcha, constraint `data_type`, build skip vs warn thresholds, source schema verification) are exactly the exam's style.
 3. Re-run the debugging drills (PROJECT 3.9) — the exam leans heavily on "here's an error, what happened?"
 4. Skim §10.2 distinctions the morning of the exam, and for every scenario question ask: "which environment, command, and artifact is involved?"
+
+---
+
+## 11. Windows Gotcha — UnicodeDecodeError / cp1252
+
+**Symptom:** dbt crashes with `'charmap' codec can't decode byte 0x.. : character maps to <undefined>` (cp1252).
+
+**Cause:** on Windows, Python/dbt reads project files with the cp1252 codec and chokes on any non-ASCII byte — usually typographic characters (`←`, `—`, `§`, smart quotes, emoji) pasted from chat/docs into configs or comments, or emoji in vendored package docs.
+
+**Fix:** `setx PYTHONUTF8 1` (forces UTF-8 everywhere; reopen the terminal). Also avoid pasting rich text into `.sql`/`.yml` — retype comments as plain ASCII.
